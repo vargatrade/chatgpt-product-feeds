@@ -1,0 +1,75 @@
+name: SvetPristroju.cz – aktualizacia OpenAI feedu
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Iné hodiny a minúty než KT, aby sa znížilo riziko konfliktov pri push.
+    - cron: '43 1,5,9,13,17,21 * * *'
+      timezone: 'Europe/Bratislava'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: svetpristroju-feed
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: true
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Previest aktualny CZ Webareal XML na OpenAI CSV
+        run: python convert_svetpristroju.py --report /tmp/svetpristroju-audit.json
+
+      - name: Overit vystup pred publikovanim
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv
+          from pathlib import Path
+          p = Path('feeds/svetpristroju-chatgpt.csv')
+          with p.open(encoding='utf-8', newline='') as f:
+              rows = list(csv.DictReader(f))
+          assert len(rows) >= 100, f'Podozrivo malo produktov: {len(rows)}'
+          assert len({r['item_id'] for r in rows}) == len(rows), 'Duplicitne ID'
+          for r in rows:
+              assert r['price'].endswith(' CZK'), r['item_id']
+              assert r['target_countries'] == '["CZ"]', r['item_id']
+              assert r['store_country'] == 'CZ', r['item_id']
+              assert r['brand'].strip(), r['item_id']
+              assert r['url'].startswith('https://www.svetpristroju.cz/'), r['item_id']
+          print(f'Validovanych {len(rows)} CZ produktov')
+          PY
+
+      - name: Bezpecne publikovat iba SP feed
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- feeds/svetpristroju-chatgpt.csv
+          if git diff --cached --quiet; then
+            echo 'SP katalog je nezmeneny; nie je co publikovat.'
+            exit 0
+          fi
+          git commit -m 'Aktualizacia ChatGPT katalogu SvetPristroju.cz'
+          for attempt in 1 2 3; do
+            git pull --rebase origin main
+            if git push origin HEAD:main; then
+              echo 'SP feed bol uspesne publikovany.'
+              exit 0
+            fi
+            echo "Push konflikt, pokus $attempt/3"
+            sleep 3
+          done
+          echo 'Publikovanie zlyhalo; predosla verzia v GitHube ostala zachovana.' >&2
+          exit 1
